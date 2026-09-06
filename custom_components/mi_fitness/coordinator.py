@@ -288,12 +288,18 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     try_silent_token_refresh, pass_token, user_id
                 )
                 if creds.get("service_token"):
-                    new_data = {**self._entry.data, CONF_SERVICE_TOKEN: creds["service_token"]}
+                    new_data = dict(self._entry.data)
+                    refreshed_tokens = {
+                        CONF_PASS_TOKEN: creds.get("pass_token"),
+                        CONF_SERVICE_TOKEN: creds.get("service_token"),
+                        CONF_SSECURITY: creds.get("ssecurity"),
+                    }
+                    for key, value in refreshed_tokens.items():
+                        if value and value != self._entry.data.get(key):
+                            new_data[key] = value
+
                     if creds.get("ssecurity"):
-                        new_data[CONF_SSECURITY] = creds["ssecurity"]
                         self._client.ssecurity = creds["ssecurity"]
-                    # Do NOT update passToken — server rotates it on each exchange,
-                    # and the new passToken gives different (wrong) ssecurity.
                     self._client.update_service_token(creds["service_token"])
                     self.hass.config_entries.async_update_entry(self._entry, data=new_data)
                     _LOGGER.warning("Silent refresh succeeded — resuming on next poll")
