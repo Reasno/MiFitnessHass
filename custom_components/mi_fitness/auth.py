@@ -8,11 +8,11 @@ Login is a 3-step dance:
      (may loop: captcha code needed, or identity verification needed)
   3. GET  {location}  (→ sts.api.io.mi.com/sts)                      → serviceToken cookie
 
-Email 2FA flow (when notificationUrl returned):
+OTP 2FA flow (when notificationUrl returned):
   1. GET  notificationUrl                               → HTML page (authStart)
-  2. GET  /identity/list?sid=xiaomiio&context=<ctx>     → sets identity_session cookie
-  3. POST /identity/auth/sendEmailTicket                → email sent
-  4. POST /identity/auth/verifyEmail (ticket=<otp>)     → location or fallback
+  2. GET  /identity/list?sid=xiaomiio&context=<ctx>     → option=4 SMS / option=8 email
+  3. POST /identity/auth/send{Phone|Email}Ticket        → OTP sent
+  4. POST /identity/auth/verify{Phone|Email}            → location or fallback
   5. GET  /identity/result/check                        → 302 → Auth2/end URL
   6. GET  Auth2/end (no redirect)                       → extension-pragma header → ssecurity
   7. GET  STS URL                                       → serviceToken cookie
@@ -344,7 +344,7 @@ class XiaomiLoginSession:
             # show e.captcha_url to user, ask for code
             result = ls.submit_captcha(code)
 
-    Email 2FA case:
+    OTP 2FA case:
         try:
             ls.start(username, password)
         except XiaomiApprovalRequired:
@@ -366,6 +366,7 @@ class XiaomiLoginSession:
         self._psecurity_2fa         = ""   # psecurity from extension-pragma (try as signing key)
         self._ssecurity_from_login  = ""   # ssecurity from serviceLoginAuth2 when 2FA triggered
         self._c_user_id_from_login  = ""
+        self._verification_option   = 0    # 4=SMS, 8=email (from /identity/list)
 
     def start(self, username: str, password: str) -> "LoginResult":
         """Begin login. May raise XiaomiCaptchaRequired or XiaomiApprovalRequired."""
@@ -389,16 +390,15 @@ class XiaomiLoginSession:
             self._session.cookies.set("serviceToken", service_token, domain=domain)
         _LOGGER.debug("Injected browser serviceToken into login session")
 
-    # ── Email 2FA flow ────────────────────────────────────────────────────────
+    # ── OTP 2FA flow ──────────────────────────────────────────────────────────
 
     def start_email_verification(self) -> None:
         """
-        Initiate email OTP flow.  Must be called right after XiaomiApprovalRequired.
+        Initiate the OTP flow selected by /identity/list.
 
-        Steps:
-          1. GET notificationUrl          → HTML authStart page (sets session cookies)
-          2. GET /identity/list           → sets identity_session cookie (critical!)
-          3. POST sendEmailTicket         → Xiaomi sends OTP email
+        Xiaomi currently reports option=4 for SMS and option=8 for email.  The
+        method name is kept for config-flow compatibility, but the actual
+        channel and endpoints are selected dynamically.
         """
         if not self._notification_url:
             raise XiaomiLoginError("No notificationUrl — call start() first")
@@ -418,7 +418,7 @@ class XiaomiLoginSession:
         _LOGGER.debug("authStart: HTTP=%d  final_url=%s  cookies=%s",
                       r.status_code, r.url, list(self._session.cookies.keys()))
 
-        # 2) GET /identity/list — this call sets identity_session cookie
+        # 2) GET /identity/list — sets identity_session and selects the channel.
         _LOGGER.debug("GET /identity/list  context=%s", context)
         r = self._session.get(
             "https://account.xiaomi.com/identity/list",
@@ -427,12 +427,28 @@ class XiaomiLoginSession:
         )
         _LOGGER.debug("identity/list: HTTP=%d  cookies=%s",
                       r.status_code, list(self._session.cookies.keys()))
+        try:
+            identity_data = json.loads(r.text.replace("&&&START&&&", "").strip())
+        except Exception as exc:
+            raise XiaomiLoginError("Could not parse identity/list response") from exc
 
-        # 3) POST sendEmailTicket
+        option = int(identity_data.get("option") or identity_data.get("flag") or 0)
+        options = [int(value) for value in identity_data.get("options", [])]
+        if option not in (4, 8):
+            option = next((value for value in options if value in (4, 8)), 0)
+        if option not in (4, 8):
+            raise XiaomiLoginError(
+                f"Unsupported identity verification options: {options or [option]}"
+            )
+        self._verification_option = option
+        channel = "Phone" if option == 4 else "Email"
+
+        # 3) Ask Xiaomi to send an OTP through the selected channel.
         dc = int(time.time() * 1000)
         ick = self._session.cookies.get("ick", "")
+        endpoint = f"https://account.xiaomi.com/identity/auth/send{channel}Ticket"
         r = self._session.post(
-            "https://account.xiaomi.com/identity/auth/sendEmailTicket",
+            endpoint,
             params={
                 "_dc":     str(dc),
                 "sid":     "miothealth",
@@ -449,37 +465,44 @@ class XiaomiLoginSession:
             headers={"X-Requested-With": "XMLHttpRequest"},
             timeout=15,
         )
-        _LOGGER.warning("sendEmailTicket: HTTP=%d  body=%s",
-                        r.status_code, r.text[:300])
+        _LOGGER.warning("send%sTicket: HTTP=%d  body=%s",
+                        channel, r.status_code, r.text[:300])
         try:
-            jr = r.json()
+            jr = json.loads(r.text.replace("&&&START&&&", "").strip())
             code = jr.get("code", -1)
             if code not in (0,) and jr.get("result") != "ok":
-                _LOGGER.warning("sendEmailTicket non-OK: code=%s msg=%s",
-                                code, jr.get("message", ""))
-        except Exception:
-            pass
+                raise XiaomiLoginError(
+                    f"Could not send {channel.lower()} OTP: code={code}"
+                )
+        except XiaomiLoginError:
+            raise
+        except Exception as exc:
+            raise XiaomiLoginError(
+                f"Could not parse send{channel}Ticket response"
+            ) from exc
 
     def verify_with_code(self, otp_code: str) -> "LoginResult":
         """
-        Submit OTP from email, then complete the verification chain:
-          1. POST /identity/auth/verifyEmail
-          2. GET  /identity/result/check  (fallback if no location returned)
-          3. GET  Auth2/end (no redirect) → extension-pragma → ssecurity
-          4. GET  STS URL                 → serviceToken cookie
+        Submit an OTP through the channel selected by /identity/list, then
+        complete result/check → Auth2/end → STS.
         """
         if not self._context:
             raise XiaomiLoginError("No context — call start_email_verification() first")
+        if self._verification_option not in (4, 8):
+            raise XiaomiLoginError("No verification option — request an OTP first")
 
         context = self._context
+        option = self._verification_option
+        channel = "Phone" if option == 4 else "Email"
         dc = int(time.time() * 1000)
         ick = self._session.cookies.get("ick", "")
 
-        # 1) POST verifyEmail
+        # 1) POST verifyPhone (option=4) or verifyEmail (option=8).
+        endpoint = f"https://account.xiaomi.com/identity/auth/verify{channel}"
         r = self._session.post(
-            "https://account.xiaomi.com/identity/auth/verifyEmail",
+            endpoint,
             params={
-                "_flag":   "8",
+                "_flag":   str(option),
                 "_json":   "true",
                 "sid":     "miothealth",
                 "context": context,
@@ -487,7 +510,7 @@ class XiaomiLoginSession:
                 "_locale": "en_US",
             },
             data={
-                "_flag":  "8",
+                "_flag":  str(option),
                 "ticket": otp_code.strip(),
                 "trust":  "false",
                 "_json":  "true",
@@ -496,8 +519,8 @@ class XiaomiLoginSession:
             headers={"X-Requested-With": "XMLHttpRequest"},
             timeout=15,
         )
-        _LOGGER.warning("verifyEmail: HTTP=%d  body=%s",
-                        r.status_code, r.text[:400])
+        _LOGGER.warning("verify%s: HTTP=%d  body=%s",
+                        channel, r.status_code, r.text[:400])
 
         # Extract finish location from response (body may have &&&START&&& prefix)
         finish_loc: str | None = None
@@ -506,7 +529,8 @@ class XiaomiLoginSession:
             resp_json = json.loads(r.text.replace("&&&START&&&", ""))
             code = resp_json.get("code", -1)
             result_str = resp_json.get("result", "")
-            _LOGGER.debug("verifyEmail json: code=%s result=%s", code, result_str)
+            _LOGGER.debug("verify%s json: code=%s result=%s",
+                          channel, code, result_str)
             finish_loc = resp_json.get("location")
             # Extract numeric userId from location query params
             if finish_loc:
@@ -516,13 +540,14 @@ class XiaomiLoginSession:
                 except Exception:
                     pass
             if not finish_loc and code not in (0,) and result_str != "ok":
-                _LOGGER.warning("verifyEmail code=%s, trying fallback", code)
+                _LOGGER.warning("verify%s code=%s, trying fallback", channel, code)
         except Exception:
             pass
 
         # 2) Fallback: GET /identity/result/check
         if not finish_loc:
-            _LOGGER.debug("verifyEmail: no location, fallback to /identity/result/check")
+            _LOGGER.debug("verify%s: no location, fallback to /identity/result/check",
+                          channel)
             r0 = self._session.get(
                 "https://account.xiaomi.com/identity/result/check",
                 params={"sid": "miothealth", "context": context, "_locale": "en_US"},
@@ -610,7 +635,7 @@ class XiaomiLoginSession:
             raise XiaomiLoginError("serviceToken not found after STS redirect")
 
         # Collect userId / cUserId
-        # Priority: numeric ID from verifyEmail response URL > stored > cookies
+        # Priority: numeric ID from OTP verification response URL > stored > cookies
         user_id = (
             numeric_user_id
             or self._user_id
