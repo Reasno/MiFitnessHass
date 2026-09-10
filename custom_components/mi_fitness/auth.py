@@ -317,7 +317,7 @@ def try_silent_token_refresh(pass_token: str, user_id: str) -> dict:
             "service_token": service_token,
             "user_id":       creds.get("user_id", user_id),
             "c_user_id":     creds.get("c_user_id", ""),
-            "pass_token":    pass_token,  # keep original, don't rotate
+            "pass_token":    creds.get("pass_token") or pass_token,
         }
 
     _LOGGER.warning(
