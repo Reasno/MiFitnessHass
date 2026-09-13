@@ -14,6 +14,10 @@ CONF_USERNAME      = "username"
 CONF_PASSWORD      = "password"
 CONF_AUTH_METHOD   = "auth_method"
 CONF_PASS_TOKEN    = "pass_token"    # passToken — used for silent serviceToken refresh
+# Persisted login deviceId cookie (an_<32 hex>). Must stay STABLE across logins and
+# silent refreshes so Xiaomi remembers the device after one trusted 2FA (trust=true).
+# NOTE: unrelated to CONF_PHONE_ID above, which is a data-API query parameter.
+CONF_LOGIN_DEVICE_ID = "login_device_id"
 
 AUTH_METHOD_TOKENS   = "tokens"    # Path A: manual token entry
 AUTH_METHOD_PASSWORD = "password"  # Path B: username + password auto-login

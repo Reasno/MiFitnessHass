@@ -60,10 +60,14 @@ class XiaomiApprovalRequired(XiaomiLoginError):
 
 # ── Session builder ───────────────────────────────────────────────────────────
 
-def _make_login_session() -> requests.Session:
+def new_login_device_id() -> str:
+    """Generate a fresh login deviceId cookie value (an_<32 hex>)."""
+    return "an_" + "".join(random.choices("0123456789abcdef", k=32))
+
+
+def _make_login_session(device_id: str = "") -> requests.Session:
     # Native-app Dalvik UA. The server issues a different ssecurity based on UA —
     # Dalvik/APP/xiaomi.wearable yields the ssecurity that hlth.io.mi.com expects.
-    dev_hex = "".join(random.choices("0123456789abcdef", k=32))
     ua = (
         "Dalvik/2.1.0 (Linux; U; Android 14; SM-F721B Build/UP1A.231005.007) "
         "APP/xiaomi.wearable APPV/355000 MK/U00tRjcyMUI= "
@@ -76,7 +80,12 @@ def _make_login_session() -> requests.Session:
         "User-Agent":   ua,
         "Content-Type": "application/x-www-form-urlencoded",
     })
-    s.cookies.update({"sdkVersion": "3.8.6", "deviceId": f"an_{dev_hex}"})
+    # A stable deviceId is required for trust=true to have any effect: Xiaomi binds
+    # the "trusted device" to this cookie. Falls back to a random one when unset.
+    s.cookies.update({
+        "sdkVersion": "3.8.6",
+        "deviceId": device_id or new_login_device_id(),
+    })
     return s
 
 
@@ -288,7 +297,7 @@ def _exchange_pass_token(
     return {}
 
 
-def try_silent_token_refresh(pass_token: str, user_id: str) -> dict:
+def try_silent_token_refresh(pass_token: str, user_id: str, device_id: str = "") -> dict:
     """
     Silently obtain fresh ssecurity + xiaomiio serviceToken using stored passToken.
 
@@ -300,7 +309,7 @@ def try_silent_token_refresh(pass_token: str, user_id: str) -> dict:
     """
     if not pass_token or not user_id:
         return {}
-    session = _make_login_session()
+    session = _make_login_session(device_id)
 
     # miothealth exchange: gives health-specific ssecurity + serviceToken (sts-hlth.io.mi.com).
     creds = _exchange_pass_token(session, user_id, pass_token, sid="miothealth")
@@ -352,8 +361,11 @@ class XiaomiLoginSession:
             result = ls.verify_with_code(otp)   # submit code
     """
 
-    def __init__(self) -> None:
-        self._session               = _make_login_session()
+    def __init__(self, device_id: str = "") -> None:
+        # Stable across the whole flow AND across later silent refreshes when the
+        # caller persists .device_id into the config entry.
+        self._device_id             = device_id or new_login_device_id()
+        self._session               = _make_login_session(self._device_id)
         self._username              = ""
         self._password              = ""
         self._last_sign             = ""
@@ -367,6 +379,11 @@ class XiaomiLoginSession:
         self._ssecurity_from_login  = ""   # ssecurity from serviceLoginAuth2 when 2FA triggered
         self._c_user_id_from_login  = ""
         self._verification_option   = 0    # 4=SMS, 8=email (from /identity/list)
+
+    @property
+    def device_id(self) -> str:
+        """Login deviceId used by this session — persist it into the config entry."""
+        return self._device_id
 
     def start(self, username: str, password: str) -> "LoginResult":
         """Begin login. May raise XiaomiCaptchaRequired or XiaomiApprovalRequired."""
@@ -512,7 +529,7 @@ class XiaomiLoginSession:
             data={
                 "_flag":  str(option),
                 "ticket": otp_code.strip(),
-                "trust":  "false",
+                "trust":  "true",
                 "_json":  "true",
                 "ick":    ick,
             },
@@ -707,7 +724,7 @@ class XiaomiLoginSession:
         # miothealth exchange: health-specific ssecurity + serviceToken from sts-hlth.io.mi.com.
         up_success = False
         if pass_token_cookie and user_id:
-            fresh = _make_login_session()
+            fresh = _make_login_session(self._device_id)
             creds = _exchange_pass_token(fresh, user_id, pass_token_cookie, sid="miothealth")
             if creds.get("ssecurity") and creds.get("service_token"):
                 ssecurity     = creds["ssecurity"]

@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import MiFitnessApiError, MiFitnessAuthError, MiFitnessClient
 from .auth import try_silent_token_refresh
 from .const import (
+    CONF_LOGIN_DEVICE_ID,
     CONF_PASS_TOKEN,
     CONF_SERVICE_TOKEN,
     CONF_SSECURITY,
@@ -285,7 +286,8 @@ class MiFitnessCoordinator(DataUpdateCoordinator):
                     "serviceToken expired — attempting silent refresh with passToken"
                 )
                 creds = await self.hass.async_add_executor_job(
-                    try_silent_token_refresh, pass_token, user_id
+                    try_silent_token_refresh, pass_token, user_id,
+                    self._entry.data.get(CONF_LOGIN_DEVICE_ID, ""),
                 )
                 if creds.get("service_token"):
                     new_data = dict(self._entry.data)
